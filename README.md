@@ -8,8 +8,7 @@ A demo project for a fictional hospital (**City Care Hospital**, fictional docto
 
 ## Demo
 
-- Video: **ADD_VIDEO_LINK_HERE**
-- LinkedIn write-up: **ADD_LINKEDIN_POST_LINK_HERE**
+- LinkedIn write-up & Video: https://www.linkedin.com/feed/update/urn:li:activity:7522353009175969794/)
 
 <!-- After you add screenshots to docs/images/, remove these comment markers:
 ![Booking workflow in n8n](docs/images/workflow-book-appointment.png)
@@ -138,7 +137,7 @@ The full walkthrough is in [docs/setup-guide.md](docs/setup-guide.md).
 
 ## Author
 
-Built by **Ansar Hayat**, AI automation engineer. GitHub: [@ansarhayat9](https://github.com/ansarhayat9) · LinkedIn: **ADD_LINKEDIN_PROFILE_LINK_HERE**
+Built by **Ansar Hayat**, AI automation engineer. GitHub: [@ansarhayat9](https://github.com/ansarhayat9) · LinkedIn: (https://www.linkedin.com/in/ansar-hayat-b7a50a293/)
 
 If your clinic loses bookings to missed calls and you would like something like this, get in touch.
 

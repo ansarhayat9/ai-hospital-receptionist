@@ -1,0 +1,498 @@
+{
+  "name": "V1 - Tool 2 - Book Appointment",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "book-appointment",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "b2000000-0000-4000-8000-000000000901"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Helper functions (shared by the Code nodes in this workflow) =====\n// Hospital timezone: Asia/Karachi = UTC+5 all year (no daylight saving)\nconst TZ_OFFSET_MIN = 300;\nconst DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];\nconst LONG_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];\nconst LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];\n\nfunction pad(n) { return String(n).padStart(2, '0'); }\nfunction clean(v) { return String(v === undefined || v === null ? '' : v).trim(); }\nfunction escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\n\n// \"09:00\", \"9:00:00\", \"9:00 AM\" -> minutes since midnight (or null)\nfunction parseHM(v) {\n  const m = clean(v).toLowerCase().match(/(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*(am|pm)?/);\n  if (!m) return null;\n  let h = parseInt(m[1], 10);\n  const min = parseInt(m[2], 10);\n  if (m[3] === 'pm' && h < 12) h += 12;\n  if (m[3] === 'am' && h === 12) h = 0;\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\nfunction hm(mins) { return pad(Math.floor(mins / 60)) + ':' + pad(mins % 60); }\nfunction display12(mins) {\n  let h = Math.floor(mins / 60);\n  const m = mins % 60;\n  const ap = h >= 12 ? 'PM' : 'AM';\n  h = h % 12;\n  if (h === 0) h = 12;\n  return h + ':' + pad(m) + ' ' + ap;\n}\nfunction isRealDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return false;\n  const [y, mo, d] = s.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;\n}\nfunction dateToMs(dateStr, mins) { // Karachi local date + minutes -> UTC milliseconds\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return Date.UTC(y, mo - 1, d, 0, 0) + mins * 60000 - TZ_OFFSET_MIN * 60000;\n}\nfunction weekday(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return new Date(Date.UTC(y, mo - 1, d)).getUTCDay();\n}\nfunction addDays(dateStr, n) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d + n));\n  return dt.getUTCFullYear() + '-' + pad(dt.getUTCMonth() + 1) + '-' + pad(dt.getUTCDate());\n}\nfunction nowKarachi() {\n  const ms = Date.now();\n  const k = new Date(ms + TZ_OFFSET_MIN * 60000);\n  return {\n    ms: ms,\n    date: k.getUTCFullYear() + '-' + pad(k.getUTCMonth() + 1) + '-' + pad(k.getUTCDate()),\n    stamp: k.toISOString().slice(0, 19).replace('T', ' ')\n  };\n}\nfunction niceDate(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return LONG_DAYS[dt.getUTCDay()] + ', ' + d + ' ' + LONG_MONTHS[mo - 1] + ' ' + y;\n}\n// \"Mon-Sat\", \"Mon, Tue, Thu\" -> Set of weekday numbers (0 = Sunday)\nfunction parseDays(str) {\n  const out = new Set();\n  for (const part of clean(str).toLowerCase().split(',')) {\n    const p = part.trim();\n    if (!p) continue;\n    if (p.includes('-')) {\n      const ab = p.split('-').map(x => DAY_NAMES.indexOf(x.trim().slice(0, 3)));\n      if (ab[0] < 0 || ab[1] < 0) continue;\n      let i = ab[0];\n      out.add(i);\n      while (i !== ab[1]) { i = (i + 1) % 7; out.add(i); }\n    } else {\n      const i = DAY_NAMES.indexOf(p.slice(0, 3));\n      if (i >= 0) out.add(i);\n    }\n  }\n  return out;\n}\n// Google Calendar event start/end -> milliseconds (null for all-day or empty items)\nfunction evTime(v) {\n  if (!v) return null;\n  const s = typeof v === 'string' ? v : v.dateTime;\n  if (!s) return null;\n  const ms = Date.parse(s);\n  return isNaN(ms) ? null : ms;\n}\n// Calendar events that block this doctor (title or description mentions the doctor)\nfunction blockingEvents(events, doctor) {\n  const name = clean(doctor.name).toLowerCase();\n  const id = clean(doctor.doctor_id).toLowerCase();\n  const out = [];\n  for (const e of events) {\n    const s = evTime(e.start);\n    const en = evTime(e.end);\n    if (s === null || en === null) continue;\n    if (e.status === 'cancelled') continue;\n    const text = (clean(e.summary) + ' ' + clean(e.description)).toLowerCase();\n    if ((name && text.includes(name)) || (id && text.includes('doctor_id: ' + id))) out.push({ s: s, en: en });\n  }\n  return out;\n}\n// All free slots for one doctor on one date\nfunction slotsForDay(doctor, dateStr, ctx) {\n  if (ctx.holidays.has(dateStr)) return [];\n  if (!parseDays(doctor.working_days).has(weekday(dateStr))) return [];\n  const S = parseHM(doctor.start_time);\n  const E = parseHM(doctor.end_time);\n  const step = parseInt(doctor.slot_minutes, 10);\n  if (S === null || E === null || !step || step <= 0) return [];\n  const blocks = blockingEvents(ctx.events, doctor);\n  const out = [];\n  for (let t = S; t + step <= E; t += step) {\n    const startMs = dateToMs(dateStr, t);\n    const endMs = startMs + step * 60000;\n    if (startMs < ctx.nowMs + ctx.minLead * 60000) continue;\n    if (blocks.some(b => startMs < b.en && endMs > b.s)) continue;\n    out.push({\n      doctor_id: clean(doctor.doctor_id),\n      doctor_name: clean(doctor.name),\n      department: clean(doctor.department),\n      date: dateStr,\n      date_display: niceDate(dateStr),\n      start: hm(t),\n      start_display: display12(t),\n      minutes: t\n    });\n  }\n  return out;\n}\nfunction publicSlot(s) {\n  return { doctor_id: s.doctor_id, doctor_name: s.doctor_name, department: s.department, date: s.date, date_display: s.date_display, start: s.start, start_display: s.start_display };\n}\nfunction describeSlots(slots) {\n  const groups = new Map();\n  for (const s of slots) {\n    const k = s.doctor_name + '|' + s.date;\n    if (!groups.has(k)) groups.set(k, { doc: s.doctor_name, date: s.date, times: [] });\n    groups.get(k).times.push(s.start_display);\n  }\n  return Array.from(groups.values()).map(g => g.doc + ' on ' + niceDate(g.date) + ' at ' + g.times.join(', ')).join('; ');\n}\nfunction readSettings(rows) {\n  const o = {};\n  for (const r of rows) if (clean(r.key)) o[clean(r.key)] = clean(r.value);\n  return o;\n}\nfunction intSetting(settings, key, def) {\n  const v = parseInt(settings[key], 10);\n  return isNaN(v) ? def : v;\n}\nfunction readHolidays(rows) {\n  const set = new Set();\n  for (const r of rows) {\n    const m = clean(r.date).match(/\\d{4}-\\d{2}-\\d{2}/);\n    if (m) set.add(m[0]);\n  }\n  return set;\n}\n\n// Prepare Request: clean and check what the voice agent sent before we touch any calendar\nconst raw = ($input.first().json.body) || {};\nconst errors = [];\n\nconst doctor_id = clean(raw.doctor_id).toUpperCase();\nif (!doctor_id) errors.push('doctor_id is missing');\n\nconst date = clean(raw.date);\nconst dateOk = isRealDate(date);\nif (!dateOk) errors.push('date must be a real date like 2026-10-20');\n\nconst startMin = parseHM(raw.start_time);\nif (startMin === null) errors.push('start_time must look like 10:20');\n\nconst patient_name = clean(raw.patient_name).replace(/[\\u0000-\\u001f<>]/g, '').slice(0, 80);\nif (patient_name.length < 2) errors.push('patient_name is missing');\n\nconst phone = clean(raw.phone).replace(/[\\u06F0-\\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0)).replace(/[\\u0660-\\u0669]/g, d => String(d.charCodeAt(0) - 0x0660)).replace(/\\D/g, '');\nif (phone.length < 10 || phone.length > 13) errors.push('phone must have 10 to 13 digits');\n\nlet email = clean(raw.email).toLowerCase();\nif (email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) email = '';\n\nconst pt = clean(raw.patient_type).toLowerCase();\nconst patient_type = (pt.includes('return') || pt.includes('follow')) ? 'returning' : 'new';\nconst visit_category = (clean(raw.visit_category) || 'general consultation').replace(/[\\u0000-\\u001f<>]/g, '').slice(0, 60);\n\nconst base = dateOk ? date : nowKarachi().date;\nreturn [{\n  json: {\n    errors: errors,\n    doctor_id: doctor_id,\n    date: dateOk ? date : '',\n    start_time: startMin === null ? '' : hm(startMin),\n    patient_name: patient_name,\n    phone: phone,\n    email: email,\n    patient_type: patient_type,\n    visit_category: visit_category,\n    timeMin: base + 'T00:00:00+05:00',\n    timeMax: addDays(base, 1) + 'T00:00:00+05:00'\n  }\n}];\n"
+      },
+      "id": "b2000000-0000-4000-8000-000000000002",
+      "name": "Prepare Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000003",
+      "name": "Get Settings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Settings' tab.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000004",
+      "name": "Get Doctors",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        660,
+        300
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Doctors' tab.",
+      "notesInFlow": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000005",
+      "name": "Get Holidays",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Holidays' tab.",
+      "notesInFlow": true,
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "returnAll": true,
+        "timeMin": "={{ $('Prepare Request').first().json.timeMin }}",
+        "timeMax": "={{ $('Prepare Request').first().json.timeMax }}",
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000006",
+      "name": "Get Calendar Events",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        300
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "notes": "Pick your Google account and the 'Hospital Appointments' calendar.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Helper functions (shared by the Code nodes in this workflow) =====\n// Hospital timezone: Asia/Karachi = UTC+5 all year (no daylight saving)\nconst TZ_OFFSET_MIN = 300;\nconst DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];\nconst LONG_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];\nconst LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];\n\nfunction pad(n) { return String(n).padStart(2, '0'); }\nfunction clean(v) { return String(v === undefined || v === null ? '' : v).trim(); }\nfunction escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\n\n// \"09:00\", \"9:00:00\", \"9:00 AM\" -> minutes since midnight (or null)\nfunction parseHM(v) {\n  const m = clean(v).toLowerCase().match(/(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*(am|pm)?/);\n  if (!m) return null;\n  let h = parseInt(m[1], 10);\n  const min = parseInt(m[2], 10);\n  if (m[3] === 'pm' && h < 12) h += 12;\n  if (m[3] === 'am' && h === 12) h = 0;\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\nfunction hm(mins) { return pad(Math.floor(mins / 60)) + ':' + pad(mins % 60); }\nfunction display12(mins) {\n  let h = Math.floor(mins / 60);\n  const m = mins % 60;\n  const ap = h >= 12 ? 'PM' : 'AM';\n  h = h % 12;\n  if (h === 0) h = 12;\n  return h + ':' + pad(m) + ' ' + ap;\n}\nfunction isRealDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return false;\n  const [y, mo, d] = s.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;\n}\nfunction dateToMs(dateStr, mins) { // Karachi local date + minutes -> UTC milliseconds\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return Date.UTC(y, mo - 1, d, 0, 0) + mins * 60000 - TZ_OFFSET_MIN * 60000;\n}\nfunction weekday(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return new Date(Date.UTC(y, mo - 1, d)).getUTCDay();\n}\nfunction addDays(dateStr, n) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d + n));\n  return dt.getUTCFullYear() + '-' + pad(dt.getUTCMonth() + 1) + '-' + pad(dt.getUTCDate());\n}\nfunction nowKarachi() {\n  const ms = Date.now();\n  const k = new Date(ms + TZ_OFFSET_MIN * 60000);\n  return {\n    ms: ms,\n    date: k.getUTCFullYear() + '-' + pad(k.getUTCMonth() + 1) + '-' + pad(k.getUTCDate()),\n    stamp: k.toISOString().slice(0, 19).replace('T', ' ')\n  };\n}\nfunction niceDate(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return LONG_DAYS[dt.getUTCDay()] + ', ' + d + ' ' + LONG_MONTHS[mo - 1] + ' ' + y;\n}\n// \"Mon-Sat\", \"Mon, Tue, Thu\" -> Set of weekday numbers (0 = Sunday)\nfunction parseDays(str) {\n  const out = new Set();\n  for (const part of clean(str).toLowerCase().split(',')) {\n    const p = part.trim();\n    if (!p) continue;\n    if (p.includes('-')) {\n      const ab = p.split('-').map(x => DAY_NAMES.indexOf(x.trim().slice(0, 3)));\n      if (ab[0] < 0 || ab[1] < 0) continue;\n      let i = ab[0];\n      out.add(i);\n      while (i !== ab[1]) { i = (i + 1) % 7; out.add(i); }\n    } else {\n      const i = DAY_NAMES.indexOf(p.slice(0, 3));\n      if (i >= 0) out.add(i);\n    }\n  }\n  return out;\n}\n// Google Calendar event start/end -> milliseconds (null for all-day or empty items)\nfunction evTime(v) {\n  if (!v) return null;\n  const s = typeof v === 'string' ? v : v.dateTime;\n  if (!s) return null;\n  const ms = Date.parse(s);\n  return isNaN(ms) ? null : ms;\n}\n// Calendar events that block this doctor (title or description mentions the doctor)\nfunction blockingEvents(events, doctor) {\n  const name = clean(doctor.name).toLowerCase();\n  const id = clean(doctor.doctor_id).toLowerCase();\n  const out = [];\n  for (const e of events) {\n    const s = evTime(e.start);\n    const en = evTime(e.end);\n    if (s === null || en === null) continue;\n    if (e.status === 'cancelled') continue;\n    const text = (clean(e.summary) + ' ' + clean(e.description)).toLowerCase();\n    if ((name && text.includes(name)) || (id && text.includes('doctor_id: ' + id))) out.push({ s: s, en: en });\n  }\n  return out;\n}\n// All free slots for one doctor on one date\nfunction slotsForDay(doctor, dateStr, ctx) {\n  if (ctx.holidays.has(dateStr)) return [];\n  if (!parseDays(doctor.working_days).has(weekday(dateStr))) return [];\n  const S = parseHM(doctor.start_time);\n  const E = parseHM(doctor.end_time);\n  const step = parseInt(doctor.slot_minutes, 10);\n  if (S === null || E === null || !step || step <= 0) return [];\n  const blocks = blockingEvents(ctx.events, doctor);\n  const out = [];\n  for (let t = S; t + step <= E; t += step) {\n    const startMs = dateToMs(dateStr, t);\n    const endMs = startMs + step * 60000;\n    if (startMs < ctx.nowMs + ctx.minLead * 60000) continue;\n    if (blocks.some(b => startMs < b.en && endMs > b.s)) continue;\n    out.push({\n      doctor_id: clean(doctor.doctor_id),\n      doctor_name: clean(doctor.name),\n      department: clean(doctor.department),\n      date: dateStr,\n      date_display: niceDate(dateStr),\n      start: hm(t),\n      start_display: display12(t),\n      minutes: t\n    });\n  }\n  return out;\n}\nfunction publicSlot(s) {\n  return { doctor_id: s.doctor_id, doctor_name: s.doctor_name, department: s.department, date: s.date, date_display: s.date_display, start: s.start, start_display: s.start_display };\n}\nfunction describeSlots(slots) {\n  const groups = new Map();\n  for (const s of slots) {\n    const k = s.doctor_name + '|' + s.date;\n    if (!groups.has(k)) groups.set(k, { doc: s.doctor_name, date: s.date, times: [] });\n    groups.get(k).times.push(s.start_display);\n  }\n  return Array.from(groups.values()).map(g => g.doc + ' on ' + niceDate(g.date) + ' at ' + g.times.join(', ')).join('; ');\n}\nfunction readSettings(rows) {\n  const o = {};\n  for (const r of rows) if (clean(r.key)) o[clean(r.key)] = clean(r.value);\n  return o;\n}\nfunction intSetting(settings, key, def) {\n  const v = parseInt(settings[key], 10);\n  return isNaN(v) ? def : v;\n}\nfunction readHolidays(rows) {\n  const set = new Set();\n  for (const r of rows) {\n    const m = clean(r.date).match(/\\d{4}-\\d{2}-\\d{2}/);\n    if (m) set.add(m[0]);\n  }\n  return set;\n}\n\n// Check Slot and Build: re-check everything right now, then prepare the booking\nconst prep = $('Prepare Request').first().json;\nconst settings = readSettings($('Get Settings').all().map(i => i.json));\nconst doctors = $('Get Doctors').all().map(i => i.json).filter(d => clean(d.doctor_id) && clean(d.name));\nconst holidays = readHolidays($('Get Holidays').all().map(i => i.json));\nconst events = $input.all().map(i => i.json);\n\nconst minLead = intSetting(settings, 'min_lead_minutes', 120);\nconst maxAdvance = intSetting(settings, 'max_advance_days', 30);\nconst hospital = settings.hospital_name || 'the hospital';\nconst now = nowKarachi();\n\nconst fail = (status, message, extra) => [{ json: { ok: false, response: Object.assign({ status: status, message: message }, extra || {}) } }];\n\nif (prep.errors && prep.errors.length) return fail('invalid', 'Some details are missing or invalid: ' + prep.errors.join('; ') + '.');\n\nconst doctor = doctors.find(d => clean(d.doctor_id).toUpperCase() === prep.doctor_id);\nif (!doctor) return fail('invalid', 'I could not find that doctor. Check availability again.');\n\nif (prep.date < now.date) return fail('invalid', 'That date is in the past.');\nif (prep.date > addDays(now.date, maxAdvance)) return fail('invalid', 'Appointments can only be booked up to ' + maxAdvance + ' days ahead.');\nif (holidays.has(prep.date)) return fail('invalid', 'The hospital is closed on that date.');\nif (!parseDays(doctor.working_days).has(weekday(prep.date))) return fail('invalid', clean(doctor.name) + ' does not see patients on that day.');\n\nconst S = parseHM(doctor.start_time);\nconst E = parseHM(doctor.end_time);\nconst step = parseInt(doctor.slot_minutes, 10);\nconst startMin = parseHM(prep.start_time);\nif (S === null || E === null || !step) return fail('error', 'The doctor schedule is not set up correctly.');\nif (startMin < S || startMin + step > E || (startMin - S) % step !== 0) return fail('invalid', 'That time is not a valid appointment slot. Check availability again.');\n\nconst startMs = dateToMs(prep.date, startMin);\nconst endMs = startMs + step * 60000;\nif (startMs < now.ms + minLead * 60000) return fail('invalid', 'That time is too soon to book. Offer a later slot.');\n\nconst ctx = { holidays: holidays, events: events, nowMs: now.ms, minLead: minLead };\nconst blocks = blockingEvents(events, doctor);\nif (blocks.some(b => startMs < b.en && endMs > b.s)) {\n  const alts = slotsForDay(doctor, prep.date, ctx).slice(0, 3);\n  return fail('slot_taken', 'That slot was just taken.' + (alts.length ? ' Other times that day: ' + describeSlots(alts) + '.' : ' No other times are free that day.'), { alternatives: alts.map(publicSlot) });\n}\n\nconst did = clean(doctor.doctor_id).toLowerCase();\nconst duplicate = events.some(e => {\n  if (evTime(e.start) === null) return false;\n  const text = (clean(e.summary) + ' ' + clean(e.description)).toLowerCase();\n  return text.includes('doctor_id: ' + did) && text.includes('phone: ' + prep.phone);\n});\nif (duplicate) return fail('duplicate', 'This phone number already has an appointment with this doctor on that day.');\n\nconst used = new Set();\nfor (const e of events) {\n  const found = (clean(e.description)).match(/APT-\\d{8}-\\d{3}/g) || [];\n  found.forEach(x => used.add(x));\n}\nconst ymd = prep.date.replace(/-/g, '');\nlet id = '';\nfor (let i = 0; i < 50; i++) {\n  id = 'APT-' + ymd + '-' + String(Math.floor(100 + Math.random() * 900));\n  if (!used.has(id)) break;\n}\n\nconst endMin = startMin + step;\nconst startText = hm(startMin);\nconst endText = hm(endMin);\nconst dateText = niceDate(prep.date);\nconst timeText = display12(startMin);\nconst dName = clean(doctor.name);\nconst dDept = clean(doctor.department);\n\nconst description = [\n  'appointment_id: ' + id,\n  'doctor_id: ' + clean(doctor.doctor_id),\n  'phone: ' + prep.phone,\n  'patient_type: ' + prep.patient_type,\n  'visit: ' + prep.visit_category,\n  'booked_by: voice agent'\n].join('\\n');\n\nconst response = {\n  status: 'booked',\n  appointment_id: id,\n  doctor_name: dName,\n  department: dDept,\n  date: prep.date,\n  date_display: dateText,\n  start: startText,\n  start_display: timeText,\n  message: 'Booked with ' + dName + ' on ' + dateText + ' at ' + timeText + '. Appointment ID ' + id + '.'\n};\n\nconst emailHtml =\n  '<p>Hello ' + escapeHtml(prep.patient_name) + ',</p>' +\n  '<p>Your appointment at ' + escapeHtml(hospital) + ' is confirmed.</p>' +\n  '<ul>' +\n  '<li><b>Appointment ID:</b> ' + id + '</li>' +\n  '<li><b>Doctor:</b> ' + escapeHtml(dName) + ' (' + escapeHtml(dDept) + ')</li>' +\n  '<li><b>Date:</b> ' + dateText + '</li>' +\n  '<li><b>Time:</b> ' + timeText + '</li>' +\n  '</ul>' +\n  '<p>If you need to change or cancel this appointment, please call the hospital and quote your appointment ID.</p>' +\n  '<p>' + escapeHtml(hospital) + '</p>';\n\nreturn [{\n  json: {\n    ok: true,\n    response: response,\n    event: {\n      start: prep.date + 'T' + startText + ':00+05:00',\n      end: prep.date + 'T' + endText + ':00+05:00',\n      summary: dName + ' - ' + prep.patient_name,\n      description: description\n    },\n    email: prep.email,\n    email_subject: 'Appointment confirmed: ' + dateText + ' at ' + timeText + ' (' + id + ')',\n    email_html: emailHtml,\n    row: {\n      appointment_id: id,\n      created_at: now.stamp,\n      patient_name: prep.patient_name,\n      phone: prep.phone,\n      email: prep.email,\n      patient_type: prep.patient_type,\n      visit_category: prep.visit_category,\n      doctor_id: clean(doctor.doctor_id),\n      doctor_name: dName,\n      department: dDept,\n      date: prep.date,\n      start: startText,\n      end: endText,\n      status: 'booked',\n      source: 'voice-agent'\n    }\n  }\n}];\n"
+      },
+      "id": "b2000000-0000-4000-8000-000000000007",
+      "name": "Check Slot and Build",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0-0000-4000-8000-000000000008",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000008",
+      "name": "Slot OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "start": "={{ $json.event.start }}",
+        "end": "={{ $json.event.end }}",
+        "additionalFields": {
+          "summary": "={{ $json.event.summary }}",
+          "description": "={{ $json.event.description }}"
+        }
+      },
+      "id": "b2000000-0000-4000-8000-000000000009",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1760,
+        200
+      ],
+      "notes": "Pick your Google account and the 'Hospital Appointments' calendar.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Row: combine the booking details with the calendar event ID, in the exact order of the sheet columns\nconst info = $('Check Slot and Build').first().json;\nconst eventId = $input.first().json.id || '';\nconst r = info.row;\nreturn [{\n  json: {\n    appointment_id: r.appointment_id,\n    created_at: r.created_at,\n    patient_name: r.patient_name,\n    phone: r.phone,\n    email: r.email,\n    patient_type: r.patient_type,\n    visit_category: r.visit_category,\n    doctor_id: r.doctor_id,\n    doctor_name: r.doctor_name,\n    department: r.department,\n    date: r.date,\n    start: r.start,\n    end: r.end,\n    calendar_event_id: eventId,\n    status: r.status,\n    source: r.source\n  }\n}];\n"
+      },
+      "id": "b2000000-0000-4000-8000-000000000010",
+      "name": "Build Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000011",
+      "name": "Log Appointment",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2200,
+        200
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Appointments' tab.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Check Slot and Build').first().json.response }}",
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000012",
+      "name": "Respond Booked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0-0000-4000-8000-000000000013",
+              "leftValue": "={{ $('Check Slot and Build').first().json.email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000013",
+      "name": "Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2640,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Check Slot and Build').first().json.email }}",
+        "subject": "={{ $('Check Slot and Build').first().json.email_subject }}",
+        "message": "={{ $('Check Slot and Build').first().json.email_html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "b2000000-0000-4000-8000-000000000014",
+      "name": "Send Confirmation",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2860,
+        120
+      ],
+      "notes": "Pick your Gmail account.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {}
+      },
+      "id": "b2000000-0000-4000-8000-000000000015",
+      "name": "Respond Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Prepare Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Request": {
+      "main": [
+        [
+          {
+            "node": "Get Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Settings": {
+      "main": [
+        [
+          {
+            "node": "Get Doctors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Doctors": {
+      "main": [
+        [
+          {
+            "node": "Get Holidays",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Holidays": {
+      "main": [
+        [
+          {
+            "node": "Get Calendar Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Calendar Events": {
+      "main": [
+        [
+          {
+            "node": "Check Slot and Build",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Slot and Build": {
+      "main": [
+        [
+          {
+            "node": "Slot OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Build Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Row": {
+      "main": [
+        [
+          {
+            "node": "Log Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Appointment": {
+      "main": [
+        [
+          {
+            "node": "Respond Booked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Booked": {
+      "main": [
+        [
+          {
+            "node": "Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot OK?": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Email?": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

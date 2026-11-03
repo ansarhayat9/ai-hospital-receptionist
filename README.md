@@ -28,15 +28,25 @@ A demo project for a fictional hospital (**City Care Hospital**, fictional docto
 ### Example conversation
 
 > **Agent:** Thank you for calling City Care Hospital. I'm an AI assistant. How can I help you today?
+
 > **Caller:** I need a cardiologist.
+> 
 > **Agent:** One moment while I check. The earliest openings are with Dr. Sana Malik, Cardiology, on Tuesday at ten, ten twenty, or ten forty. Does one of those work?
+> 
 > **Caller:** The first one, please.
+> 
 > **Agent:** Could I have your full name and phone number? An email is optional if you would like a confirmation.
+> 
 > **Caller:** (gives name, phone, and email)
+> 
 > **Agent:** Have you visited before, and what is the visit for?
+> 
 > **Caller:** First visit, a general consultation.
+> 
 > **Agent:** *(reads the doctor, date, time, name, phone, and email back once)* Shall I book it?
+> 
 > **Caller:** Yes.
+> 
 > **Agent:** Your appointment is booked. A confirmation with your appointment ID has been emailed to you.
 
 ## How it works

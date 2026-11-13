@@ -10,11 +10,6 @@ A demo project for a fictional hospital (**City Care Hospital**, fictional docto
 
 - Demo video and write-up: [LinkedIn post](https://www.linkedin.com/feed/update/urn:li:activity:7522353009175969794/)
 
-<!-- After you add the screenshots to docs/images/, remove these comment markers:
-![The agent moves an appointment (chat)](docs/images/chat-reschedule.png)
-![The Appointments sheet after the change](docs/images/sheet-row.png)
-![The email notice the patient receives](docs/images/email-notice.png)
--->
 
 ## What it does
 
@@ -167,17 +162,7 @@ The full walkthrough is in [docs/setup-guide.md](docs/setup-guide.md).
 - **Urdu:** configured and logic-tested (numerals), but voice quality is not yet validated end to end.
 - **Production use:** a real hospital needs a paid ElevenLabs plan in its own account (the free plan has no commercial license) and a privacy and compliance review.
 
-## Roadmap
 
-- [x] Cancel and reschedule with identity checks (appointment ID plus phone)
-- [x] Hospital information answers (timings, location, visiting hours)
-- [x] Error-alert workflow
-- [ ] One-time code (SMS or WhatsApp) before changing an appointment
-- [ ] SMS and WhatsApp confirmations and reminders
-- [ ] Faster tools (merged reads or a small backend service)
-- [ ] A real phone number
-- [ ] Post-call summaries and a management dashboard
-- [ ] Urdu voice validation
 
 ## Author
 

@@ -6,7 +6,8 @@ const DIR = path.join(__dirname, '..', '..', 'src', 'code-nodes');
 const lib = fs.readFileSync(path.join(DIR, 'lib.js'), 'utf8');
 
 function run(file, ctx) {
-  const code = lib + '\n' + fs.readFileSync(path.join(DIR, file), 'utf8');
+  const extra = file.startsWith('manage-') ? '\n' + fs.readFileSync(path.join(DIR, 'lib-manage.js'), 'utf8') : '';
+  const code = lib + extra + '\n' + fs.readFileSync(path.join(DIR, file), 'utf8');
   const fn = new Function('$input', '$', code);
   const wrap = rows => rows.map(r => ({ json: r }));
   const named = {};
@@ -154,6 +155,113 @@ let c = run('cb-prepare.js', { input: [{ body: { patient_name: 'Sara Ali', phone
 expect('callback ok', [c.valid, c.response.status, Object.keys(c.row).length], [true, 'logged', 7]);
 c = run('cb-prepare.js', { input: [{ body: { patient_name: '', phone: '1', reason: '' } }] })[0].json;
 expect('callback invalid', [c.valid, c.response.status], [false, 'invalid']);
+
+
+// ---- Version 2: manage appointment (find, cancel, reschedule) ----
+function manage(action, body, events) {
+  const prep = run('manage-prepare.js', { input: [{ query: { action }, body }] })[0].json;
+  const out = run('manage-process.js', { input: events || [{}], nodes: { 'Prepare Request': [prep], 'Get Settings': settings, 'Get Doctors': doctors, 'Get Holidays': holidays } });
+  return { prep, res: out[0].json };
+}
+const mineEv = { id: 'evt1', summary: 'Dr. Sana Malik - Ali Raza',
+  description: 'appointment_id: APT-20261020-314\ndoctor_id: D03\nphone: 03001234567\nemail: ali@example.com\npatient_type: new\nvisit: general consultation\nbooked_by: voice agent',
+  start: { dateTime: '2026-10-20T10:20:00+05:00' }, end: { dateTime: '2026-10-20T10:40:00+05:00' } };
+const okIds = { appointment_id: 'APT-20261020-314', phone: '03001234567' };
+
+let m = manage('find', okIds, [mineEv]);
+expect('find: verified appointment', [m.res.response.status, m.res.response.doctor_name, m.res.response.start_display, m.res.response.can_change], ['found', 'Dr. Sana Malik', '10:20 AM', true]);
+m = manage('find', { appointment_id: 'A P T dash 2 0 2 6 1 0 2 0 dash 3 1 4', phone: '+92 300 1234567' }, [mineEv]);
+expect('find: spoken id and +92 phone still match', m.res.response.status, 'found');
+m = manage('find', { appointment_id: 'APT-\u06F2\u06F0\u06F2\u06F6\u06F1\u06F0\u06F2\u06F0-\u06F3\u06F1\u06F4', phone: '\u06F0\u06F3\u06F0\u06F0\u06F1\u06F2\u06F3\u06F4\u06F5\u06F6\u06F7' }, [mineEv]);
+expect('find: Urdu numerals in id and phone', m.res.response.status, 'found');
+m = manage('find', { appointment_id: 'APT-20261020-3144', phone: '03001234567' }, [mineEv]);
+expect('find: too many digits -> invalid', m.res.response.status, 'invalid');
+m = manage('find', { appointment_id: 'APT-20261020-314', phone: '03009999999' }, [mineEv]);
+expect('find: wrong phone -> not_found', m.res.response.status, 'not_found');
+m = manage('find', { appointment_id: 'APT-20261020-999', phone: '03001234567' }, [mineEv]);
+expect('find: wrong id -> same not_found message', [m.res.response.status, m.res.response.message === manage('find', { appointment_id: 'APT-20261020-314', phone: '03009999999' }, [mineEv]).res.response.message], ['not_found', true]);
+m = manage('find', { appointment_id: 'APT-2026', phone: '03001234567' }, [mineEv]);
+expect('find: incomplete id -> invalid', m.res.response.status, 'invalid');
+m = manage('find', { appointment_id: 'APT-20261020-314', phone: '123' }, [mineEv]);
+expect('find: short phone -> invalid', m.res.response.status, 'invalid');
+m = manage('delete', okIds, [mineEv]);
+expect('unknown action -> invalid', m.res.response.status, 'invalid');
+m = manage('find', { appointment_id: 'APT-20261010-100', phone: '03001234567' }, [mineEv]);
+expect('find: old appointment with no upcoming event -> not_found', m.res.response.status, 'not_found');
+const soonEv = Object.assign({}, mineEv, { description: mineEv.description.replace('20261020', '20261017'), start: { dateTime: '2026-10-17T13:00:00+05:00' }, end: { dateTime: '2026-10-17T13:15:00+05:00' } });
+m = manage('cancel', { appointment_id: 'APT-20261017-314', phone: '03001234567' }, [soonEv]);
+expect('cancel: inside the cutoff -> too_late', m.res.response.status, 'too_late');
+m = manage('find', { appointment_id: 'APT-20261017-314', phone: '03001234567' }, [soonEv]);
+expect('find: inside the cutoff shows can_change false', [m.res.response.status, m.res.response.can_change], ['found', false]);
+
+m = manage('cancel', okIds, [mineEv]);
+expect('cancel: ok', [m.res.route, m.res.response.status, m.res.event_id, m.res.row, m.res.email], ['cancel', 'cancelled', 'evt1', { appointment_id: 'APT-20261020-314', status: 'cancelled' }, 'ali@example.com']);
+m = manage('cancel', { appointment_id: 'APT-20261020-314', phone: '03009999999' }, [mineEv]);
+expect('cancel: wrong phone -> not_found, nothing deleted', [m.res.route, m.res.response.status], ['reply', 'not_found']);
+m = manage('cancel', okIds, [Object.assign({}, mineEv, { status: 'cancelled' })]);
+expect('cancel: already-cancelled event is ignored', m.res.response.status, 'not_found');
+
+const rs = (extra) => manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-27', new_start_time: '10:00' }, extra || {}), [mineEv].concat((extra && extra.__events) || []));
+m = rs();
+expect('reschedule: ok', [m.res.route, m.res.response.status, m.res.response.start_display, m.res.new_event.start, m.res.new_event.end, m.res.row.status], ['reschedule', 'rescheduled', '10:00 AM', '2026-10-27T10:00:00+05:00', '2026-10-27T10:20:00+05:00', 'rescheduled']);
+expect('reschedule: description keeps id and notes the old time', [/appointment_id: APT-20261020-314/.test(m.res.new_event.description), /rescheduled_from: 2026-10-20 10:20/.test(m.res.new_event.description)], [true, true]);
+expect('reschedule: window starts today and covers the next 45 days', [m.prep.timeMin, m.prep.timeMax], ['2026-10-17T00:00:00+05:00', '2026-12-02T00:00:00+05:00']);
+const farRs = manage('reschedule', Object.assign({}, okIds, { new_date: '2027-03-01', new_start_time: '10:00' }), [mineEv]);
+expect('reschedule: window extends to a later new date', farRs.prep.timeMax, '2027-03-02T00:00:00+05:00');
+const movedEv = Object.assign({}, mineEv, { start: { dateTime: '2026-10-27T10:00:00+05:00' }, end: { dateTime: '2026-10-27T10:20:00+05:00' }, description: mineEv.description + '\nrescheduled_from: 2026-10-20 10:20' });
+m = manage('find', okIds, [movedEv]);
+expect('find after a cross-day reschedule: ID date differs from the event date', [m.res.response.status, m.res.response.date, m.res.response.start_display], ['found', '2026-10-27', '10:00 AM']);
+m = manage('cancel', okIds, [movedEv]);
+expect('cancel after a cross-day reschedule', [m.res.route, m.res.response.status, m.res.event_id], ['cancel', 'cancelled', 'evt1']);
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-29', new_start_time: '10:20' }), [movedEv]);
+expect('second reschedule keeps a single rescheduled_from line', [m.res.response.status, (m.res.new_event.description.match(/rescheduled_from/g) || []).length, /rescheduled_from: 2026-10-27 10:00/.test(m.res.new_event.description)], ['rescheduled', 1, true]);
+const takenEv = { id: 'evt2', summary: 'Dr. Sana Malik - Busy', description: 'doctor_id: D03', start: { dateTime: '2026-10-27T10:00:00+05:00' }, end: { dateTime: '2026-10-27T10:20:00+05:00' } };
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-27', new_start_time: '10:00' }), [mineEv, takenEv]);
+expect('reschedule: taken slot -> slot_taken with alternatives', [m.res.response.status, m.res.response.alternatives[0].start], ['slot_taken', '10:20']);
+const takenSameDay = { id: 'evt4', summary: 'Dr. Sana Malik - Busy', description: 'doctor_id: D03', start: { dateTime: '2026-10-20T10:00:00+05:00' }, end: { dateTime: '2026-10-20T10:20:00+05:00' } };
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-20', new_start_time: '10:00' }), [mineEv, takenSameDay]);
+expect('reschedule: same-day alternatives never include the current time', [m.res.response.status, m.res.response.alternatives.map(a => a.start)], ['slot_taken', ['10:40', '11:00', '11:20']]);
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-20', new_start_time: '10:20' }), [mineEv]);
+expect('reschedule: same time -> invalid', m.res.response.status, 'invalid');
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-21', new_start_time: '10:00' }), [mineEv]);
+expect('reschedule: doctor day off -> invalid', m.res.response.status, 'invalid');
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-22', new_start_time: '10:00' }), [mineEv]);
+expect('reschedule: holiday -> invalid', m.res.response.status, 'invalid');
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-27', new_start_time: '10:25' }), [mineEv]);
+expect('reschedule: off the slot grid -> invalid', m.res.response.status, 'invalid');
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-10', new_start_time: '10:00' }), [mineEv]);
+expect('reschedule: past new date -> invalid', m.res.response.status, 'invalid');
+m = manage('reschedule', okIds, [mineEv]);
+expect('reschedule: missing new slot -> invalid', m.res.response.status, 'invalid');
+const otherMine = { id: 'evt3', summary: 'Dr. Sana Malik - Ali Raza', description: 'appointment_id: APT-20261027-500\ndoctor_id: D03\nphone: 03001234567', start: { dateTime: '2026-10-27T11:00:00+05:00' }, end: { dateTime: '2026-10-27T11:20:00+05:00' } };
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-27', new_start_time: '10:00' }), [mineEv, otherMine]);
+expect('reschedule: another booking same doctor same day -> duplicate', m.res.response.status, 'duplicate');
+m = manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-27', new_start_time: '10:00' }), [Object.assign({}, mineEv, { description: mineEv.description.replace('doctor_id: D03', 'doctor_id: D99') })]);
+expect('reschedule: unknown doctor in the event -> error', m.res.response.status, 'error');
+const br2 = run('manage-buildrow.js', { input: [{ id: 'newEvt' }], nodes: { 'Process Request': [manage('reschedule', Object.assign({}, okIds, { new_date: '2026-10-27', new_start_time: '10:00' }), [mineEv]).res], 'Create New Event': [{ id: 'newEvt' }] } })[0].json;
+expect('build row (reschedule) carries the new calendar event id', [br2.appointment_id, br2.calendar_event_id, br2.date, br2.status], ['APT-20261020-314', 'newEvt', '2026-10-27', 'rescheduled']);
+const br3 = run('manage-buildrow.js', { input: [{ success: true }], nodes: { 'Process Request': [manage('cancel', okIds, [mineEv]).res] } })[0].json;
+expect('build row (cancel) only sets the status', br3, { appointment_id: 'APT-20261020-314', status: 'cancelled' });
+
+// ---- Version 2: hospital info ----
+const infoRows = [
+  { topic: 'visiting hours', keywords: 'visitors, visiting time, attendants', answer: 'Visiting hours are 4 PM to 6 PM every day.' },
+  { topic: 'location', keywords: 'address, where, directions, map', answer: 'City Care Hospital is on Example Road, Lahore.' },
+  { topic: 'outpatient timings', keywords: 'opd, opening hours, timings, open', answer: 'Outpatient clinics run Monday to Saturday.' },
+  { topic: 'emergency', keywords: 'emergency department, er, ambulance, urgent', answer: 'The emergency department is open 24 hours. Call 1122.' }
+];
+function info(topic, rows) {
+  const prep = run('info-prepare.js', { input: [{ body: { topic } }] })[0].json;
+  return run('info-find.js', { input: rows || infoRows, nodes: { 'Prepare Request': [prep] } })[0].json.response;
+}
+expect('info: exact topic', [info('visiting hours').status, info('Visiting Hours').answer], ['ok', 'Visiting hours are 4 PM to 6 PM every day.']);
+expect('info: keyword match', info('what is your address').topic, 'location');
+expect('info: opd timings', info('opd timings').topic, 'outpatient timings');
+expect('info: unknown topic -> not_found', [info('helicopter landing').status, info('helicopter landing').available_topics.length], ['not_found', 4]);
+expect('info: short keyword "er" does not match inside other words', [info('helicopter landing').status, info('computer repair').status], ['not_found', 'not_found']);
+expect('info: short keyword "er" still matches as a whole word', info('the er').topic, 'emergency');
+expect('info: empty topic -> invalid', info('').status, 'invalid');
+expect('info: empty sheet -> not_found', info('visiting hours', [{}]).status, 'not_found');
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail === 0 ? 0 : 1);

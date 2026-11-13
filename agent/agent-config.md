@@ -1,4 +1,4 @@
-# ElevenLabs agent configuration
+# ElevenLabs agent configuration (Version 2)
 
 Everything needed to recreate the agent. The conversation prompt lives in [`system-prompt.txt`](system-prompt.txt); paste it into the agent's **System prompt** field.
 
@@ -29,20 +29,24 @@ Thank you for calling City Care Hospital. I'm an AI assistant. How can I help yo
 سٹی کیئر ہسپتال کو کال کرنے کا شکریہ۔ میں ایک اے آئی اسسٹنٹ ہوں۔ میں آپ کی کیا مدد کر سکتی ہوں؟
 ```
 
-## 2. Tools (three webhook tools)
+## 2. Tools (seven webhook tools)
 
 Create each with **Tools → Add tool → Webhook**, method **POST**. Replace `YOUR-N8N-HOST` with your n8n host and use the **production** URL (it contains `/webhook/`, not `/webhook-test/`). All parameters are type **String** with value type **LLM Prompt**. Fill in the top-level body description as well; the form will not save without it.
 
+The three appointment tools below share one n8n webhook (`manage-appointment`). The action is part of the URL (`?action=find`, `?action=cancel`, `?action=reschedule`), so the agent never has to send it.
+
+> **Do not skip the `?action=...` part.** If the three tools all use the plain `/manage-appointment` address, n8n cannot tell them apart and every request is answered with an "unknown request" (the agent then wrongly says it couldn't find the appointment). After saving, reopen each tool and check the URL kept its ending. If your ElevenLabs version drops it, add a body parameter named `action` with a **constant** value (`find`, `cancel`, or `reschedule`) instead; the workflow accepts either.
+
 ### Advanced settings
 
-| Setting | check_availability | book_appointment | request_callback |
-|---|---|---|---|
-| Response timeout | 20 s | 30 s | 20 s |
-| Interruptions | Allow | Block (if offered) | Allow |
-| Error handling | Auto | Auto | Auto |
-| Pre-tool speech | Force | Force | Force |
-| Execution mode | Immediate | Immediate | Immediate |
-| Response filtering | All fields | All fields | All fields |
+| Setting | Lookups: check_availability, find_appointment, get_hospital_info, request_callback | Changes data: book_appointment, cancel_appointment, reschedule_appointment |
+|---|---|---|
+| Response timeout | 20 s | 30 s |
+| Interruptions | Allow | Block (if offered) |
+| Error handling | Auto | Auto |
+| Pre-tool speech | Force | Force |
+| Execution mode | Immediate | Immediate |
+| Response filtering | All fields | All fields |
 
 ### `check_availability`
 
@@ -86,8 +90,49 @@ Create each with **Tools → Add tool → Webhook**, method **POST**. Replace `Y
 | `phone` | Yes | The caller's phone number, digits only. |
 | `reason` | Yes | A short reason, for example billing question or wants to speak to reception. Never include medical details. |
 
+### `find_appointment`
+
+- URL: `https://YOUR-N8N-HOST/webhook/manage-appointment?action=find`
+- Description: `Looks up an existing appointment from its appointment ID and the phone number it was booked with. Use before cancelling or moving an appointment.`
+- Body description: `The appointment ID and phone number the caller gives to identify their appointment.`
+
+| Parameter | Required | Description |
+|---|---|---|
+| `appointment_id` | Yes | The appointment ID the caller reads out: the letters APT, an eight-digit date, and three digits, for example APT-20261027-314. Use digits only after APT. |
+| `phone` | Yes | The phone number the appointment was booked with, digits only. |
+
+### `cancel_appointment`
+
+- URL: `https://YOUR-N8N-HOST/webhook/manage-appointment?action=cancel`
+- Description: `Cancels an appointment. Use only after find_appointment returned found and the caller clearly confirmed they want to cancel it.`
+- Body description: `The appointment ID and phone number of the appointment to cancel.`
+- Parameters: `appointment_id` and `phone`, exactly as for `find_appointment`.
+
+### `reschedule_appointment`
+
+- URL: `https://YOUR-N8N-HOST/webhook/manage-appointment?action=reschedule`
+- Description: `Moves an appointment to a new slot returned by check_availability. Use only after find_appointment returned found and the caller clearly confirmed the new date and time.`
+- Body description: `The appointment ID, phone number, and the chosen new slot.`
+
+| Parameter | Required | Description |
+|---|---|---|
+| `appointment_id` | Yes | As for find_appointment. |
+| `phone` | Yes | As for find_appointment. |
+| `new_date` | Yes | The date of the chosen new slot, YYYY-MM-DD, copied from the slot. |
+| `new_start_time` | Yes | The start time of the chosen new slot in 24-hour HH:MM format, copied from the slot's start field, for example 10:20. |
+
+### `get_hospital_info`
+
+- URL: `https://YOUR-N8N-HOST/webhook/get-hospital-info`
+- Description: `Looks up general hospital information such as visiting hours, location, outpatient timings, and documents to bring. Use for these questions instead of answering from memory.`
+- Body description: `The topic the caller is asking about.`
+
+| Parameter | Required | Description |
+|---|---|---|
+| `topic` | Yes | A short topic phrase, for example visiting hours, location, outpatient timings, emergency, or documents to bring. |
+
 ## 3. Maintenance notes
 
 - If you rename a tool parameter, change it in the matching n8n Prepare Request node too.
 - The emergency number (1122) is written into the prompt. Change it for your region and verify it.
-- After editing the agent: **Save**, confirm all three tools appear in the Tools list, then **Publish**.
+- After editing the agent: **Save**, confirm all seven tools appear in the Tools list, then **Publish**.

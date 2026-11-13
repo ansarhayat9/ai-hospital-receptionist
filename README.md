@@ -1,18 +1,19 @@
 # AI Hospital Receptionist
 
-**A voice AI that answers the phone, finds an open slot, books the appointment, and emails the confirmation. No human touches a calendar.**
+**A voice AI that answers the phone, finds an open slot, books the appointment, emails the confirmation, and handles cancellations, reschedules, and common hospital questions. No human touches a calendar.**
 
-![ElevenLabs Agents](https://img.shields.io/badge/voice-ElevenLabs%20Agents-black) ![n8n](https://img.shields.io/badge/backend-n8n-EA4B71) ![Google Workspace](https://img.shields.io/badge/data-Calendar%20%C2%B7%20Sheets%20%C2%B7%20Gmail-4285F4) ![Tests](https://img.shields.io/badge/tests-23%20live%20%2B%2050%20offline-brightgreen) ![License](https://img.shields.io/badge/license-MIT-blue)
+![ElevenLabs Agents](https://img.shields.io/badge/voice-ElevenLabs%20Agents-black) ![n8n](https://img.shields.io/badge/backend-n8n-EA4B71) ![Google Workspace](https://img.shields.io/badge/data-Calendar%20%C2%B7%20Sheets%20%C2%B7%20Gmail-4285F4) ![Tests](https://img.shields.io/badge/tests-43%20live%20%2B%2092%20offline-brightgreen) ![License](https://img.shields.io/badge/license-MIT-blue)
 
 A demo project for a fictional hospital (**City Care Hospital**, fictional doctors, fake patient data only). It shows how a voice agent can run a real workflow end to end: understanding a caller, checking real availability, booking safely, and handling emergencies and out-of-scope requests.
 
 ## Demo
 
-- LinkedIn write-up & Video: https://www.linkedin.com/feed/update/urn:li:activity:7522353009175969794/)
+- Demo video and write-up: [LinkedIn post](https://www.linkedin.com/feed/update/urn:li:activity:7522353009175969794/)
 
-<!-- After you add screenshots to docs/images/, remove these comment markers:
-![Booking workflow in n8n](docs/images/workflow-book-appointment.png)
-![Calendar event and sheet row created by the agent](docs/images/booking-result.png)
+<!-- After you add the screenshots to docs/images/, remove these comment markers:
+![The agent moves an appointment (chat)](docs/images/chat-reschedule.png)
+![The Appointments sheet after the change](docs/images/sheet-row.png)
+![The email notice the patient receives](docs/images/email-notice.png)
 -->
 
 ## What it does
@@ -20,6 +21,8 @@ A demo project for a fictional hospital (**City Care Hospital**, fictional docto
 - Understands the **doctor or department** the caller wants and finds real open slots, or the **earliest openings** when the caller has no day in mind
 - Collects the details in **two short turns**, reads everything back **once**, and books only after a clear "yes"
 - Creates the **Google Calendar** event, logs the booking in **Google Sheets**, and sends a **Gmail** confirmation
+- **Cancels or reschedules** an appointment after checking the appointment ID and the phone number it was booked with, and emails a notice
+- Answers **general hospital questions** (visiting hours, location, timings, documents to bring) only from a sheet, never from guesswork
 - Rejects unknown doctors and departments, past dates, holidays, double bookings, duplicate bookings, and bad phone numbers
 - Recognizes **emergencies** and sends the caller to 1122 instead of booking
 - Gives **no medical advice** and takes a **callback request** when it cannot help
@@ -28,26 +31,44 @@ A demo project for a fictional hospital (**City Care Hospital**, fictional docto
 ### Example conversation
 
 > **Agent:** Thank you for calling City Care Hospital. I'm an AI assistant. How can I help you today?
-
+>
 > **Caller:** I need a cardiologist.
-> 
+>
 > **Agent:** One moment while I check. The earliest openings are with Dr. Sana Malik, Cardiology, on Tuesday at ten, ten twenty, or ten forty. Does one of those work?
-> 
+>
 > **Caller:** The first one, please.
-> 
+>
 > **Agent:** Could I have your full name and phone number? An email is optional if you would like a confirmation.
-> 
-> **Caller:** (gives name, phone, and email)
-> 
+>
+> **Caller:** *(gives name, phone, and email)*
+>
 > **Agent:** Have you visited before, and what is the visit for?
-> 
+>
 > **Caller:** First visit, a general consultation.
-> 
+>
 > **Agent:** *(reads the doctor, date, time, name, phone, and email back once)* Shall I book it?
-> 
+>
 > **Caller:** Yes.
-> 
+>
 > **Agent:** Your appointment is booked. A confirmation with your appointment ID has been emailed to you.
+
+### Example: moving an appointment
+
+> **Caller:** I need to move my appointment.
+>
+> **Agent:** Of course. Could I have your appointment ID and the phone number you booked with?
+>
+> **Caller:** *(gives both)*
+>
+> **Agent:** I found your appointment with Dr. Sana Malik on Tuesday at ten. Would you like to cancel it or move it?
+>
+> **Caller:** Move it, please.
+>
+> **Agent:** *(checks Dr. Sana's availability and offers three slots)* Shall I move it to Thursday at ten twenty with Dr. Sana Malik?
+>
+> **Caller:** Yes.
+>
+> **Agent:** Done. Your appointment is now on Thursday at ten twenty. The appointment ID stays the same.
 
 ## How it works
 
@@ -57,6 +78,8 @@ flowchart LR
     A -->|"check_availability"| W1["n8n: Check Availability"]
     A -->|"book_appointment"| W2["n8n: Book Appointment"]
     A -->|"request_callback"| W3["n8n: Request Callback"]
+    A -->|"find / cancel / reschedule"| W4["n8n: Manage Appointment"]
+    A -->|"get_hospital_info"| W5["n8n: Hospital Info"]
     W1 --> S[("Google Sheets<br/>Doctors, Holidays, Settings")]
     W1 --> CAL[("Google Calendar")]
     W2 --> S
@@ -65,6 +88,11 @@ flowchart LR
     W2 --> G1["Gmail: confirmation"]
     W3 --> CB[("Callbacks sheet")]
     W3 --> G2["Gmail: alert to reception"]
+    W4 --> CAL
+    W4 --> LOG
+    W4 --> G1
+    W5 --> INFO[("Hospital_Info sheet")]
+    ERR["n8n: Error Alert"] -.->|"email when any workflow fails"| DEV(["Developer"])
 ```
 
 **The AI talks. Code decides.** ElevenLabs runs the conversation. The three n8n workflows do the exact work with plain logic: working hours, holidays, lead time, double-booking and duplicate checks. There is no language model inside n8n, so slot results are the same every time and can be tested. The slot is checked once when offered and **again at the moment of booking**.
@@ -74,6 +102,8 @@ flowchart LR
 | `check_availability` | `POST /check-availability` | Validates the doctor or department first, then returns open slots, the earliest openings, or a clear reason |
 | `book_appointment` | `POST /book-appointment` | Re-checks the slot, creates the calendar event, logs the row, answers, then emails the patient |
 | `request_callback` | `POST /request-callback` | Logs the request and alerts reception |
+| `find_appointment`, `cancel_appointment`, `reschedule_appointment` | `POST /manage-appointment?action=...` | Verifies the ID and phone number, then looks up, cancels, or moves the appointment, updates the sheet, and emails a notice |
+| `get_hospital_info` | `POST /get-hospital-info` | Answers general questions from the `Hospital_Info` sheet only |
 
 More detail: [architecture](docs/architecture.md) · [tool API](docs/tool-api.md) · [design decisions](docs/design-decisions.md)
 
@@ -82,7 +112,7 @@ More detail: [architecture](docs/architecture.md) · [tool API](docs/tool-api.md
 | Layer | Tool |
 |---|---|
 | Voice and conversation | ElevenLabs Agents |
-| Backend logic | n8n (3 workflows, 32 nodes) |
+| Backend logic | n8n (6 workflows, 56 nodes) |
 | Source of truth for bookings | Google Calendar |
 | Rules and records | Google Sheets |
 | Notifications | Gmail |
@@ -93,11 +123,12 @@ More detail: [architecture](docs/architecture.md) · [tool API](docs/tool-api.md
 Voice minutes are expensive, so problems are found in the cheapest layer first:
 
 ```bash
-node tests/logic/harness.js      # 50 offline logic checks, no setup
-python tests/test_tools.py       # 23 live tests against your n8n workflows
+node tests/logic/harness.js      # 92 offline logic checks, no setup
+python tests/test_tools.py       # 43 live tests against your n8n workflows
+python tests/stage_test_appointment.py   # stage a test appointment for a cheap agent test
 ```
 
-The tests cover double bookings, duplicate bookings, past dates, holidays, unknown doctors and departments, short phone numbers, invalid slot times, and callback validation. See [testing](docs/testing.md).
+The tests cover double bookings, duplicate bookings, past dates, holidays, unknown doctors and departments, short phone numbers, invalid slot times, callback validation, and the full cancel and reschedule lifecycle. See [testing](docs/testing.md).
 
 ## Repository structure
 
@@ -108,13 +139,13 @@ The tests cover double bookings, duplicate bookings, past dates, holidays, unkno
 ├── docs/             architecture, tool API, design decisions, setup, testing
 ├── src/code-nodes/   readable copies of the n8n Code node logic
 ├── tests/            offline logic checks and live integration tests
-└── workflows/        the three n8n workflows (credentials removed)
+└── workflows/        the six n8n workflows (credentials removed)
 ```
 
 ## Quick start
 
 1. Import `data/city-care-hospital-sheet-template.xlsx` into Google Sheets and create a calendar named `Hospital Appointments`.
-2. Import the three files in `workflows/` into n8n, connect your Google accounts, and activate them.
+2. Import the six files in `workflows/` into n8n, connect your Google accounts, set workflow 6 as the error workflow, and activate them.
 3. Run the tests until they pass.
 4. Create the agent in ElevenLabs from `agent/agent-config.md` and `agent/system-prompt.txt`.
 
@@ -131,14 +162,17 @@ The full walkthrough is in [docs/setup-guide.md](docs/setup-guide.md).
 
 - **No locking:** two callers booking the same slot at the same instant could both succeed. Fine for one clinic; a database or queue would fix it.
 - **Speed:** each tool call takes about 4 to 5 seconds because several Google Sheets are read one after another.
-- **Duplicated rules:** the check and book workflows both apply the slot rules. A shared sub-workflow or a small backend would remove the duplication.
+- **Identity is a knowledge check:** anyone who knows an appointment ID and its phone number can change that appointment. A real deployment should add a one-time code by SMS or WhatsApp.
+- **Duplicated rules:** the check, book, and manage workflows all apply the slot rules. A shared sub-workflow or a small backend would remove the duplication.
 - **Urdu:** configured and logic-tested (numerals), but voice quality is not yet validated end to end.
 - **Production use:** a real hospital needs a paid ElevenLabs plan in its own account (the free plan has no commercial license) and a privacy and compliance review.
 
 ## Roadmap
 
-- [ ] Cancel and reschedule with identity checks (appointment ID plus phone)
-- [ ] Hospital information answers (timings, location, visiting hours)
+- [x] Cancel and reschedule with identity checks (appointment ID plus phone)
+- [x] Hospital information answers (timings, location, visiting hours)
+- [x] Error-alert workflow
+- [ ] One-time code (SMS or WhatsApp) before changing an appointment
 - [ ] SMS and WhatsApp confirmations and reminders
 - [ ] Faster tools (merged reads or a small backend service)
 - [ ] A real phone number
@@ -147,7 +181,7 @@ The full walkthrough is in [docs/setup-guide.md](docs/setup-guide.md).
 
 ## Author
 
-Built by **Ansar Hayat**, AI automation engineer. GitHub: [@ansarhayat9](https://github.com/ansarhayat9) · LinkedIn: (https://www.linkedin.com/in/ansar-hayat-b7a50a293/)
+Built by **Ansar Hayat**, AI automation engineer. GitHub: [@ansarhayat9](https://github.com/ansarhayat9) · LinkedIn: [ansar-hayat](https://www.linkedin.com/in/ansar-hayat-b7a50a293/)
 
 If your clinic loses bookings to missed calls and you would like something like this, get in touch.
 

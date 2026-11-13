@@ -72,10 +72,11 @@ const description = [
   'appointment_id: ' + id,
   'doctor_id: ' + clean(doctor.doctor_id),
   'phone: ' + prep.phone,
+  prep.email ? 'email: ' + prep.email : '',
   'patient_type: ' + prep.patient_type,
   'visit: ' + prep.visit_category,
   'booked_by: voice agent'
-].join('\n');
+].filter(Boolean).join('\n');
 
 const response = {
   status: 'booked',

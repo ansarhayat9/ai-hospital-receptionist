@@ -75,3 +75,51 @@ The doctor or department is validated before the date, so an unknown department 
 | `reason` | Yes | Short; no medical details |
 
 Responses: `{"status": "logged", "callback_id": "CB-20261027-1234", ...}` or `{"status": "invalid", ...}`.
+
+## `POST /webhook/manage-appointment?action=find|cancel|reschedule`
+
+One webhook, three actions chosen by the `action` query parameter. The caller identifies the appointment with its **ID and the phone number it was booked with**. The ID is tolerant of speech noise: only its digits are used (its date is checked for format only; the appointment is found by searching the next 45 days of the calendar) (`APT`, then an 8-digit date, then 3 digits), and Urdu or Arabic numerals are converted.
+
+| Field | find | cancel | reschedule | Notes |
+|---|---|---|---|---|
+| `appointment_id` | yes | yes | yes | For example `APT-20261027-314` |
+| `phone` | yes | yes | yes | 10 to 13 digits; the last 10 are compared |
+| `new_date` | | | yes | `YYYY-MM-DD` |
+| `new_start_time` | | | yes | 24-hour `HH:MM`, on the doctor's slot grid |
+
+```json
+{ "appointment_id": "APT-20261027-314", "phone": "03001234567" }
+```
+
+`find` success:
+
+```json
+{ "status": "found", "appointment_id": "APT-20261027-314", "doctor_id": "D03", "doctor_name": "Dr. Sana Malik",
+  "department": "Cardiology", "date": "2026-10-27", "date_display": "Tuesday, 27 October 2026",
+  "start": "10:00", "start_display": "10:00 AM", "can_change": true,
+  "message": "Found: appointment with Dr. Sana Malik on Tuesday, 27 October 2026 at 10:00 AM (Cardiology)." }
+```
+
+| Status | Returned by | Meaning |
+|---|---|---|
+| `found` | find | Verified; `can_change` is false when the appointment starts within the cutoff |
+| `cancelled` | cancel | The calendar event was deleted and the sheet row marked `cancelled` |
+| `rescheduled` | reschedule | New event created, old one deleted, row updated; the ID is unchanged |
+| `not_found` | all | No appointment matches that ID and phone number (same message for either mismatch) |
+| `too_late` | cancel, reschedule | The appointment was found but starts within `change_cutoff_minutes` (or has already started) |
+| `slot_taken` | reschedule | The new slot is busy; `alternatives` lists other times that day |
+| `duplicate` | reschedule | The same phone already holds another appointment with that doctor that day |
+| `invalid` | all | Incomplete ID, bad phone, missing new slot, closed day, off-grid time, too soon, or same time as now |
+| `error` | reschedule | The doctor's schedule could not be found or is not set up correctly |
+
+## `POST /webhook/get-hospital-info`
+
+| Field | Required | Notes |
+|---|---|---|
+| `topic` | Yes | A short phrase, for example `visiting hours` or `what is your address` |
+
+```json
+{ "status": "ok", "topic": "visiting hours", "answer": "Visiting hours are 4 PM to 6 PM every day.", "message": "Visiting hours are 4 PM to 6 PM every day." }
+```
+
+Other statuses: `not_found` (includes `available_topics`) and `invalid` (empty topic). Answers come only from the `Hospital_Info` sheet.

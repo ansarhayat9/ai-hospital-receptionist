@@ -1,0 +1,53 @@
+{
+  "name": "6 - Error Alert",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "f6000000-0000-4000-8000-000000000001",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR-EMAIL@example.com",
+        "subject": "=Workflow failed: {{ $json.workflow.name }}",
+        "message": "=<p><b>Workflow:</b> {{ $json.workflow.name }}</p><p><b>Failed node:</b> {{ $json.execution.lastNodeExecuted }}</p><p><b>Error:</b> {{ $json.execution.error.message }}</p><p><a href=\"{{ $json.execution.url }}\">Open the execution</a></p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "f6000000-0000-4000-8000-000000000002",
+      "name": "Email Developer",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        260,
+        300
+      ],
+      "notes": "Pick your Gmail account and replace YOUR-EMAIL@example.com with your own email.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Email Developer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

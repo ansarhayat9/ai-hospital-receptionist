@@ -1,0 +1,585 @@
+{
+  "name": "4 - Manage Appointment (find, cancel, reschedule)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "manage-appointment",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "d4000000-0000-4000-8000-000000000901"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Helper functions (shared by the Code nodes in this workflow) =====\n// Hospital timezone: Asia/Karachi = UTC+5 all year (no daylight saving)\nconst TZ_OFFSET_MIN = 300;\nconst DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];\nconst LONG_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];\nconst LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];\n\nfunction pad(n) { return String(n).padStart(2, '0'); }\nfunction clean(v) { return String(v === undefined || v === null ? '' : v).trim(); }\nfunction escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\n\n// \"09:00\", \"9:00:00\", \"9:00 AM\" -> minutes since midnight (or null)\nfunction parseHM(v) {\n  const m = clean(v).toLowerCase().match(/(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*(am|pm)?/);\n  if (!m) return null;\n  let h = parseInt(m[1], 10);\n  const min = parseInt(m[2], 10);\n  if (m[3] === 'pm' && h < 12) h += 12;\n  if (m[3] === 'am' && h === 12) h = 0;\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\nfunction hm(mins) { return pad(Math.floor(mins / 60)) + ':' + pad(mins % 60); }\nfunction display12(mins) {\n  let h = Math.floor(mins / 60);\n  const m = mins % 60;\n  const ap = h >= 12 ? 'PM' : 'AM';\n  h = h % 12;\n  if (h === 0) h = 12;\n  return h + ':' + pad(m) + ' ' + ap;\n}\nfunction isRealDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return false;\n  const [y, mo, d] = s.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;\n}\nfunction dateToMs(dateStr, mins) { // Karachi local date + minutes -> UTC milliseconds\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return Date.UTC(y, mo - 1, d, 0, 0) + mins * 60000 - TZ_OFFSET_MIN * 60000;\n}\nfunction weekday(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return new Date(Date.UTC(y, mo - 1, d)).getUTCDay();\n}\nfunction addDays(dateStr, n) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d + n));\n  return dt.getUTCFullYear() + '-' + pad(dt.getUTCMonth() + 1) + '-' + pad(dt.getUTCDate());\n}\nfunction nowKarachi() {\n  const ms = Date.now();\n  const k = new Date(ms + TZ_OFFSET_MIN * 60000);\n  return {\n    ms: ms,\n    date: k.getUTCFullYear() + '-' + pad(k.getUTCMonth() + 1) + '-' + pad(k.getUTCDate()),\n    stamp: k.toISOString().slice(0, 19).replace('T', ' ')\n  };\n}\nfunction niceDate(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return LONG_DAYS[dt.getUTCDay()] + ', ' + d + ' ' + LONG_MONTHS[mo - 1] + ' ' + y;\n}\n// \"Mon-Sat\", \"Mon, Tue, Thu\" -> Set of weekday numbers (0 = Sunday)\nfunction parseDays(str) {\n  const out = new Set();\n  for (const part of clean(str).toLowerCase().split(',')) {\n    const p = part.trim();\n    if (!p) continue;\n    if (p.includes('-')) {\n      const ab = p.split('-').map(x => DAY_NAMES.indexOf(x.trim().slice(0, 3)));\n      if (ab[0] < 0 || ab[1] < 0) continue;\n      let i = ab[0];\n      out.add(i);\n      while (i !== ab[1]) { i = (i + 1) % 7; out.add(i); }\n    } else {\n      const i = DAY_NAMES.indexOf(p.slice(0, 3));\n      if (i >= 0) out.add(i);\n    }\n  }\n  return out;\n}\n// Google Calendar event start/end -> milliseconds (null for all-day or empty items)\nfunction evTime(v) {\n  if (!v) return null;\n  const s = typeof v === 'string' ? v : v.dateTime;\n  if (!s) return null;\n  const ms = Date.parse(s);\n  return isNaN(ms) ? null : ms;\n}\n// Calendar events that block this doctor (title or description mentions the doctor)\nfunction blockingEvents(events, doctor) {\n  const name = clean(doctor.name).toLowerCase();\n  const id = clean(doctor.doctor_id).toLowerCase();\n  const out = [];\n  for (const e of events) {\n    const s = evTime(e.start);\n    const en = evTime(e.end);\n    if (s === null || en === null) continue;\n    if (e.status === 'cancelled') continue;\n    const text = (clean(e.summary) + ' ' + clean(e.description)).toLowerCase();\n    if ((name && text.includes(name)) || (id && text.includes('doctor_id: ' + id))) out.push({ s: s, en: en });\n  }\n  return out;\n}\n// All free slots for one doctor on one date\nfunction slotsForDay(doctor, dateStr, ctx) {\n  if (ctx.holidays.has(dateStr)) return [];\n  if (!parseDays(doctor.working_days).has(weekday(dateStr))) return [];\n  const S = parseHM(doctor.start_time);\n  const E = parseHM(doctor.end_time);\n  const step = parseInt(doctor.slot_minutes, 10);\n  if (S === null || E === null || !step || step <= 0) return [];\n  const blocks = blockingEvents(ctx.events, doctor);\n  const out = [];\n  for (let t = S; t + step <= E; t += step) {\n    const startMs = dateToMs(dateStr, t);\n    const endMs = startMs + step * 60000;\n    if (startMs < ctx.nowMs + ctx.minLead * 60000) continue;\n    if (blocks.some(b => startMs < b.en && endMs > b.s)) continue;\n    out.push({\n      doctor_id: clean(doctor.doctor_id),\n      doctor_name: clean(doctor.name),\n      department: clean(doctor.department),\n      date: dateStr,\n      date_display: niceDate(dateStr),\n      start: hm(t),\n      start_display: display12(t),\n      minutes: t\n    });\n  }\n  return out;\n}\nfunction publicSlot(s) {\n  return { doctor_id: s.doctor_id, doctor_name: s.doctor_name, department: s.department, date: s.date, date_display: s.date_display, start: s.start, start_display: s.start_display };\n}\nfunction describeSlots(slots) {\n  const groups = new Map();\n  for (const s of slots) {\n    const k = s.doctor_name + '|' + s.date;\n    if (!groups.has(k)) groups.set(k, { doc: s.doctor_name, date: s.date, times: [] });\n    groups.get(k).times.push(s.start_display);\n  }\n  return Array.from(groups.values()).map(g => g.doc + ' on ' + niceDate(g.date) + ' at ' + g.times.join(', ')).join('; ');\n}\nfunction readSettings(rows) {\n  const o = {};\n  for (const r of rows) if (clean(r.key)) o[clean(r.key)] = clean(r.value);\n  return o;\n}\nfunction intSetting(settings, key, def) {\n  const v = parseInt(settings[key], 10);\n  return isNaN(v) ? def : v;\n}\nfunction readHolidays(rows) {\n  const set = new Set();\n  for (const r of rows) {\n    const m = clean(r.date).match(/\\d{4}-\\d{2}-\\d{2}/);\n    if (m) set.add(m[0]);\n  }\n  return set;\n}\n\n// ===== Extra helpers for the manage-appointment workflow =====\nfunction digitsOnly(v) { // keeps only 0-9, converting Urdu and Arabic numerals first\n  return clean(v)\n    .replace(/[\\u06F0-\\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0))\n    .replace(/[\\u0660-\\u0669]/g, d => String(d.charCodeAt(0) - 0x0660))\n    .replace(/\\D/g, '');\n}\nfunction tail10(v) { return digitsOnly(v).slice(-10); }\nfunction descField(desc, key) { // reads \"key: value\" lines from an event description\n  const m = clean(desc).match(new RegExp('^\\\\s*' + key + ':\\\\s*(.+)$', 'mi'));\n  return m ? m[1].trim() : '';\n}\nfunction toKarachi(ms) { // UTC milliseconds -> { date: 'YYYY-MM-DD', mins: minutes since midnight }\n  const k = new Date(ms + TZ_OFFSET_MIN * 60000);\n  return {\n    date: k.getUTCFullYear() + '-' + pad(k.getUTCMonth() + 1) + '-' + pad(k.getUTCDate()),\n    mins: k.getUTCHours() * 60 + k.getUTCMinutes()\n  };\n}\n\n// Prepare Request: which action (from the URL), clean the inputs, and decide which days to read from Google Calendar\nconst input = $input.first().json;\nconst raw = input.body || {};\nconst query = input.query || {};\nlet action = clean(query.action || raw.action).toLowerCase();\nif (['find', 'cancel', 'reschedule'].indexOf(action) < 0) action = '';\n\n// Appointment ID: keep only the digits, then rebuild APT-YYYYMMDD-NNN (tolerates \"A P T dash 2 0 2 6 ...\")\nconst idDigits = digitsOnly(raw.appointment_id);\nlet appointment_id = '';\nlet idDate = '';\nif (idDigits.length === 11) {\n  const d = idDigits.slice(0, 4) + '-' + idDigits.slice(4, 6) + '-' + idDigits.slice(6, 8);\n  if (isRealDate(d)) {\n    appointment_id = 'APT-' + idDigits.slice(0, 8) + '-' + idDigits.slice(8);\n    idDate = d;\n  }\n}\nconst phone = digitsOnly(raw.phone);\nconst newDate = clean(raw.new_date);\nconst newDateOk = isRealDate(newDate);\nconst newMin = parseHM(raw.new_start_time);\n\n// The calendar window: from today to WINDOW_DAYS ahead (or the new date, if later).\n// The appointment's own date is NOT used, because a reschedule moves the event but keeps the ID.\nconst WINDOW_DAYS = 45; // keep this at least max_advance_days + 1\nconst today = nowKarachi().date;\nlet hi = addDays(today, WINDOW_DAYS);\nif (action === 'reschedule' && newDateOk && newDate > hi) hi = newDate;\n\nreturn [{\n  json: {\n    action: action,\n    appointment_id: appointment_id,\n    id_date: idDate,\n    phone: phone,\n    new_date: newDateOk ? newDate : '',\n    new_start: newMin === null ? '' : hm(newMin),\n    timeMin: today + 'T00:00:00+05:00',\n    timeMax: addDays(hi, 1) + 'T00:00:00+05:00'\n  }\n}];\n"
+      },
+      "id": "d4000000-0000-4000-8000-000000000002",
+      "name": "Prepare Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000003",
+      "name": "Get Settings",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Settings' tab.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000004",
+      "name": "Get Doctors",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        660,
+        300
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Doctors' tab.",
+      "notesInFlow": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000005",
+      "name": "Get Holidays",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Holidays' tab.",
+      "notesInFlow": true,
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "returnAll": true,
+        "timeMin": "={{ $('Prepare Request').first().json.timeMin }}",
+        "timeMax": "={{ $('Prepare Request').first().json.timeMax }}",
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000006",
+      "name": "Get Calendar Events",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1100,
+        300
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "notes": "Pick your Google account and the 'Hospital Appointments' calendar.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Helper functions (shared by the Code nodes in this workflow) =====\n// Hospital timezone: Asia/Karachi = UTC+5 all year (no daylight saving)\nconst TZ_OFFSET_MIN = 300;\nconst DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];\nconst LONG_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];\nconst LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];\n\nfunction pad(n) { return String(n).padStart(2, '0'); }\nfunction clean(v) { return String(v === undefined || v === null ? '' : v).trim(); }\nfunction escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\n\n// \"09:00\", \"9:00:00\", \"9:00 AM\" -> minutes since midnight (or null)\nfunction parseHM(v) {\n  const m = clean(v).toLowerCase().match(/(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s*(am|pm)?/);\n  if (!m) return null;\n  let h = parseInt(m[1], 10);\n  const min = parseInt(m[2], 10);\n  if (m[3] === 'pm' && h < 12) h += 12;\n  if (m[3] === 'am' && h === 12) h = 0;\n  if (h > 23 || min > 59) return null;\n  return h * 60 + min;\n}\nfunction hm(mins) { return pad(Math.floor(mins / 60)) + ':' + pad(mins % 60); }\nfunction display12(mins) {\n  let h = Math.floor(mins / 60);\n  const m = mins % 60;\n  const ap = h >= 12 ? 'PM' : 'AM';\n  h = h % 12;\n  if (h === 0) h = 12;\n  return h + ':' + pad(m) + ' ' + ap;\n}\nfunction isRealDate(s) {\n  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return false;\n  const [y, mo, d] = s.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;\n}\nfunction dateToMs(dateStr, mins) { // Karachi local date + minutes -> UTC milliseconds\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return Date.UTC(y, mo - 1, d, 0, 0) + mins * 60000 - TZ_OFFSET_MIN * 60000;\n}\nfunction weekday(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  return new Date(Date.UTC(y, mo - 1, d)).getUTCDay();\n}\nfunction addDays(dateStr, n) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d + n));\n  return dt.getUTCFullYear() + '-' + pad(dt.getUTCMonth() + 1) + '-' + pad(dt.getUTCDate());\n}\nfunction nowKarachi() {\n  const ms = Date.now();\n  const k = new Date(ms + TZ_OFFSET_MIN * 60000);\n  return {\n    ms: ms,\n    date: k.getUTCFullYear() + '-' + pad(k.getUTCMonth() + 1) + '-' + pad(k.getUTCDate()),\n    stamp: k.toISOString().slice(0, 19).replace('T', ' ')\n  };\n}\nfunction niceDate(dateStr) {\n  const [y, mo, d] = dateStr.split('-').map(Number);\n  const dt = new Date(Date.UTC(y, mo - 1, d));\n  return LONG_DAYS[dt.getUTCDay()] + ', ' + d + ' ' + LONG_MONTHS[mo - 1] + ' ' + y;\n}\n// \"Mon-Sat\", \"Mon, Tue, Thu\" -> Set of weekday numbers (0 = Sunday)\nfunction parseDays(str) {\n  const out = new Set();\n  for (const part of clean(str).toLowerCase().split(',')) {\n    const p = part.trim();\n    if (!p) continue;\n    if (p.includes('-')) {\n      const ab = p.split('-').map(x => DAY_NAMES.indexOf(x.trim().slice(0, 3)));\n      if (ab[0] < 0 || ab[1] < 0) continue;\n      let i = ab[0];\n      out.add(i);\n      while (i !== ab[1]) { i = (i + 1) % 7; out.add(i); }\n    } else {\n      const i = DAY_NAMES.indexOf(p.slice(0, 3));\n      if (i >= 0) out.add(i);\n    }\n  }\n  return out;\n}\n// Google Calendar event start/end -> milliseconds (null for all-day or empty items)\nfunction evTime(v) {\n  if (!v) return null;\n  const s = typeof v === 'string' ? v : v.dateTime;\n  if (!s) return null;\n  const ms = Date.parse(s);\n  return isNaN(ms) ? null : ms;\n}\n// Calendar events that block this doctor (title or description mentions the doctor)\nfunction blockingEvents(events, doctor) {\n  const name = clean(doctor.name).toLowerCase();\n  const id = clean(doctor.doctor_id).toLowerCase();\n  const out = [];\n  for (const e of events) {\n    const s = evTime(e.start);\n    const en = evTime(e.end);\n    if (s === null || en === null) continue;\n    if (e.status === 'cancelled') continue;\n    const text = (clean(e.summary) + ' ' + clean(e.description)).toLowerCase();\n    if ((name && text.includes(name)) || (id && text.includes('doctor_id: ' + id))) out.push({ s: s, en: en });\n  }\n  return out;\n}\n// All free slots for one doctor on one date\nfunction slotsForDay(doctor, dateStr, ctx) {\n  if (ctx.holidays.has(dateStr)) return [];\n  if (!parseDays(doctor.working_days).has(weekday(dateStr))) return [];\n  const S = parseHM(doctor.start_time);\n  const E = parseHM(doctor.end_time);\n  const step = parseInt(doctor.slot_minutes, 10);\n  if (S === null || E === null || !step || step <= 0) return [];\n  const blocks = blockingEvents(ctx.events, doctor);\n  const out = [];\n  for (let t = S; t + step <= E; t += step) {\n    const startMs = dateToMs(dateStr, t);\n    const endMs = startMs + step * 60000;\n    if (startMs < ctx.nowMs + ctx.minLead * 60000) continue;\n    if (blocks.some(b => startMs < b.en && endMs > b.s)) continue;\n    out.push({\n      doctor_id: clean(doctor.doctor_id),\n      doctor_name: clean(doctor.name),\n      department: clean(doctor.department),\n      date: dateStr,\n      date_display: niceDate(dateStr),\n      start: hm(t),\n      start_display: display12(t),\n      minutes: t\n    });\n  }\n  return out;\n}\nfunction publicSlot(s) {\n  return { doctor_id: s.doctor_id, doctor_name: s.doctor_name, department: s.department, date: s.date, date_display: s.date_display, start: s.start, start_display: s.start_display };\n}\nfunction describeSlots(slots) {\n  const groups = new Map();\n  for (const s of slots) {\n    const k = s.doctor_name + '|' + s.date;\n    if (!groups.has(k)) groups.set(k, { doc: s.doctor_name, date: s.date, times: [] });\n    groups.get(k).times.push(s.start_display);\n  }\n  return Array.from(groups.values()).map(g => g.doc + ' on ' + niceDate(g.date) + ' at ' + g.times.join(', ')).join('; ');\n}\nfunction readSettings(rows) {\n  const o = {};\n  for (const r of rows) if (clean(r.key)) o[clean(r.key)] = clean(r.value);\n  return o;\n}\nfunction intSetting(settings, key, def) {\n  const v = parseInt(settings[key], 10);\n  return isNaN(v) ? def : v;\n}\nfunction readHolidays(rows) {\n  const set = new Set();\n  for (const r of rows) {\n    const m = clean(r.date).match(/\\d{4}-\\d{2}-\\d{2}/);\n    if (m) set.add(m[0]);\n  }\n  return set;\n}\n\n// ===== Extra helpers for the manage-appointment workflow =====\nfunction digitsOnly(v) { // keeps only 0-9, converting Urdu and Arabic numerals first\n  return clean(v)\n    .replace(/[\\u06F0-\\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0))\n    .replace(/[\\u0660-\\u0669]/g, d => String(d.charCodeAt(0) - 0x0660))\n    .replace(/\\D/g, '');\n}\nfunction tail10(v) { return digitsOnly(v).slice(-10); }\nfunction descField(desc, key) { // reads \"key: value\" lines from an event description\n  const m = clean(desc).match(new RegExp('^\\\\s*' + key + ':\\\\s*(.+)$', 'mi'));\n  return m ? m[1].trim() : '';\n}\nfunction toKarachi(ms) { // UTC milliseconds -> { date: 'YYYY-MM-DD', mins: minutes since midnight }\n  const k = new Date(ms + TZ_OFFSET_MIN * 60000);\n  return {\n    date: k.getUTCFullYear() + '-' + pad(k.getUTCMonth() + 1) + '-' + pad(k.getUTCDate()),\n    mins: k.getUTCHours() * 60 + k.getUTCMinutes()\n  };\n}\n\n// Process Request: find the appointment, verify the caller, and decide what to do\nconst prep = $('Prepare Request').first().json;\nconst settings = readSettings($('Get Settings').all().map(i => i.json));\nconst doctors = $('Get Doctors').all().map(i => i.json).filter(d => clean(d.doctor_id) && clean(d.name));\nconst holidays = readHolidays($('Get Holidays').all().map(i => i.json));\nconst events = $input.all().map(i => i.json);\n\nconst minLead = intSetting(settings, 'min_lead_minutes', 120);\nconst cutoff = intSetting(settings, 'change_cutoff_minutes', 120);\nconst maxAdvance = intSetting(settings, 'max_advance_days', 30);\nconst hospital = settings.hospital_name || 'the hospital';\nconst now = nowKarachi();\n\nconst reply = (status, message, extra) => [{ json: { route: 'reply', response: Object.assign({ status: status, message: message }, extra || {}) } }];\n\nif (!prep.action) return reply('invalid', 'Unknown request.');\nif (!prep.appointment_id) return reply('invalid', 'The appointment ID is incomplete. Ask the caller to say all of it again: the letters APT, then the date, then three more digits.');\nif (prep.phone.length < 10 || prep.phone.length > 13) return reply('invalid', 'The phone number must have 10 to 13 digits. Ask the caller for the full number they booked with.');\nif (prep.action === 'reschedule' && (!prep.new_date || !prep.new_start)) return reply('invalid', 'A new date and time are needed. Offer slots with check_availability first, then use the chosen slot.');\n\n// Find the appointment in the calendar (upcoming days only) and verify the phone number (same message for either mismatch)\nconst wantedId = prep.appointment_id.toUpperCase();\nconst mine = events.find(e => {\n  if (evTime(e.start) === null || e.status === 'cancelled') return false;\n  return descField(e.description, 'appointment_id').toUpperCase() === wantedId &&\n         tail10(descField(e.description, 'phone')) === tail10(prep.phone);\n});\nif (!mine) return reply('not_found', 'I could not find an appointment with that ID and phone number. Ask the caller to check both and try once more. Do not say which one was wrong.');\n\nconst startMs = evTime(mine.start);\nconst st = toKarachi(startMs);\nconst doctorId = descField(mine.description, 'doctor_id');\nconst doctor = doctors.find(d => clean(d.doctor_id).toLowerCase() === doctorId.toLowerCase());\nconst doctorName = doctor ? clean(doctor.name) : (clean(mine.summary).split(' - ')[0] || 'the doctor');\nconst dept = doctor ? clean(doctor.department) : '';\nconst details = {\n  appointment_id: wantedId,\n  doctor_id: doctorId,\n  doctor_name: doctorName,\n  department: dept,\n  date: st.date,\n  date_display: niceDate(st.date),\n  start: hm(st.mins),\n  start_display: display12(st.mins)\n};\nconst canChange = startMs >= now.ms + cutoff * 60000;\nconst email = descField(mine.description, 'email');\nconst current = doctorName + ' on ' + details.date_display + ' at ' + details.start_display;\n\nif (prep.action === 'find') {\n  return reply('found', 'Found: appointment with ' + current + (dept ? ' (' + dept + ')' : '') + '.' + (canChange ? '' : ' It starts too soon to change online.'),\n    Object.assign({ can_change: canChange }, details));\n}\nif (!canChange) return reply('too_late', 'That appointment starts too soon to change online. Offer a callback request so reception can help.');\n\nconst wrapEmail = (headline, lines) =>\n  '<p>Hello,</p><p>' + headline + '</p><ul>' + lines.map(l => '<li>' + l + '</li>').join('') + '</ul>' +\n  '<p>If you need help, please call the hospital and quote your appointment ID.</p><p>' + escapeHtml(hospital) + '</p>';\n\nif (prep.action === 'cancel') {\n  return [{\n    json: {\n      route: 'cancel',\n      response: Object.assign({ status: 'cancelled', message: 'The appointment with ' + current + ' has been cancelled.' }, details),\n      event_id: mine.id,\n      email: email,\n      email_subject: 'Appointment cancelled (' + wantedId + ')',\n      email_html: wrapEmail('Your appointment has been cancelled.', [\n        '<b>Appointment ID:</b> ' + wantedId, '<b>Doctor:</b> ' + escapeHtml(doctorName), '<b>Was on:</b> ' + details.date_display + ' at ' + details.start_display]),\n      row: { appointment_id: wantedId, status: 'cancelled' }\n    }\n  }];\n}\n\n// ----- reschedule -----\nif (!doctor) return reply('error', 'The doctor schedule for this appointment could not be found. Offer a callback request.');\nconst nd = prep.new_date;\nconst nmin = parseHM(prep.new_start);\nif (nd < now.date) return reply('invalid', 'The new date is in the past.');\nif (nd > addDays(now.date, maxAdvance)) return reply('invalid', 'Appointments can only be booked up to ' + maxAdvance + ' days ahead.');\nif (holidays.has(nd)) return reply('invalid', 'The hospital is closed on that date.');\nif (!parseDays(doctor.working_days).has(weekday(nd))) return reply('invalid', doctorName + ' does not see patients on that day.');\nconst S = parseHM(doctor.start_time);\nconst E = parseHM(doctor.end_time);\nconst step = parseInt(doctor.slot_minutes, 10);\nif (S === null || E === null || !step) return reply('error', 'The doctor schedule is not set up correctly.');\nif (nmin < S || nmin + step > E || (nmin - S) % step !== 0) return reply('invalid', 'That time is not a valid appointment slot. Check availability again.');\nif (nd === st.date && nmin === st.mins) return reply('invalid', 'That is the same time as the current appointment.');\nconst newStartMs = dateToMs(nd, nmin);\nif (newStartMs < now.ms + minLead * 60000) return reply('invalid', 'That time is too soon to book. Offer a later slot.');\n\nconst others = events.filter(e => e.id !== mine.id);\nconst newEndMs = newStartMs + step * 60000;\nif (blockingEvents(others, doctor).some(b => newStartMs < b.en && newEndMs > b.s)) {\n  const alts = slotsForDay(doctor, nd, { holidays: holidays, events: others, nowMs: now.ms, minLead: minLead }).filter(a => !(a.date === st.date && a.minutes === st.mins)).slice(0, 3);\n  return reply('slot_taken', 'That slot was just taken.' + (alts.length ? ' Other times that day: ' + describeSlots(alts) + '.' : ' No other times are free that day.'), { alternatives: alts.map(publicSlot) });\n}\nconst dupe = others.some(e => {\n  const s = evTime(e.start);\n  if (s === null || e.status === 'cancelled') return false;\n  return toKarachi(s).date === nd &&\n         descField(e.description, 'doctor_id').toLowerCase() === doctorId.toLowerCase() &&\n         tail10(descField(e.description, 'phone')) === tail10(prep.phone);\n});\nif (dupe) return reply('duplicate', 'This phone number already has another appointment with this doctor on that day.');\n\nconst newDateText = niceDate(nd);\nconst newTimeText = display12(nmin);\nconst description = clean(mine.description).split('\\n').filter(l => !/^\\s*rescheduled_from:/i.test(l))\n  .concat('rescheduled_from: ' + st.date + ' ' + hm(st.mins)).join('\\n');\nreturn [{\n  json: {\n    route: 'reschedule',\n    response: {\n      status: 'rescheduled', appointment_id: wantedId, doctor_name: doctorName, department: dept,\n      date: nd, date_display: newDateText, start: hm(nmin), start_display: newTimeText,\n      message: 'Moved to ' + doctorName + ' on ' + newDateText + ' at ' + newTimeText + '. The appointment ID stays ' + wantedId + '.'\n    },\n    event_id: mine.id,\n    new_event: {\n      start: nd + 'T' + hm(nmin) + ':00+05:00',\n      end: nd + 'T' + hm(nmin + step) + ':00+05:00',\n      summary: clean(mine.summary),\n      description: description\n    },\n    email: email,\n    email_subject: 'Appointment rescheduled (' + wantedId + ')',\n    email_html: wrapEmail('Your appointment has been moved.', [\n      '<b>Appointment ID:</b> ' + wantedId, '<b>Doctor:</b> ' + escapeHtml(doctorName) + (dept ? ' (' + escapeHtml(dept) + ')' : ''),\n      '<b>Was:</b> ' + details.date_display + ' at ' + details.start_display, '<b>Now:</b> ' + newDateText + ' at ' + newTimeText]),\n    row: { appointment_id: wantedId, date: nd, start: hm(nmin), end: hm(nmin + step), status: 'rescheduled' }\n  }\n}];\n"
+      },
+      "id": "d4000000-0000-4000-8000-000000000007",
+      "name": "Process Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0-0000-4000-8000-000000000008",
+              "leftValue": "={{ $json.route !== 'reply' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000008",
+      "name": "Needs Change?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}",
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000009",
+      "name": "Respond Reply",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1760,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0-0000-4000-8000-000000000010",
+              "leftValue": "={{ $json.route === 'cancel' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000010",
+      "name": "Is Cancel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1760,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "start": "={{ $json.new_event.start }}",
+        "end": "={{ $json.new_event.end }}",
+        "additionalFields": {
+          "summary": "={{ $json.new_event.summary }}",
+          "description": "={{ $json.new_event.description }}"
+        }
+      },
+      "id": "d4000000-0000-4000-8000-000000000011",
+      "name": "Create New Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1980,
+        340
+      ],
+      "notes": "Pick your Google account and the 'Hospital Appointments' calendar.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "eventId": "={{ $('Process Request').first().json.event_id }}",
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000012",
+      "name": "Delete Old Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        2200,
+        200
+      ],
+      "notes": "Pick your Google account and the 'Hospital Appointments' calendar.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Update Row: the columns to change in the Appointments sheet (matched on appointment_id)\nconst info = $('Process Request').first().json;\nif (info.route === 'cancel') return [{ json: info.row }];\nconst created = $('Create New Event').first().json;\nreturn [{ json: Object.assign({}, info.row, { calendar_event_id: created.id || '' }) }];\n"
+      },
+      "id": "d4000000-0000-4000-8000-000000000013",
+      "name": "Build Update Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "appointment_id"
+          ],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000014",
+      "name": "Update Appointment Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2640,
+        200
+      ],
+      "notes": "Pick your Google Sheet document, then the 'Appointments' tab. Set Column to match on = appointment_id.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $('Process Request').first().json.response }}",
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000015",
+      "name": "Respond Done",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2860,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0-0000-4000-8000-000000000016",
+              "leftValue": "={{ $('Process Request').first().json.email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d4000000-0000-4000-8000-000000000016",
+      "name": "Has Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3080,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Process Request').first().json.email }}",
+        "subject": "={{ $('Process Request').first().json.email_subject }}",
+        "message": "={{ $('Process Request').first().json.email_html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "d4000000-0000-4000-8000-000000000017",
+      "name": "Send Notice",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        3300,
+        120
+      ],
+      "notes": "Pick your Gmail account.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Prepare Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Request": {
+      "main": [
+        [
+          {
+            "node": "Get Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Settings": {
+      "main": [
+        [
+          {
+            "node": "Get Doctors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Doctors": {
+      "main": [
+        [
+          {
+            "node": "Get Holidays",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Holidays": {
+      "main": [
+        [
+          {
+            "node": "Get Calendar Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Calendar Events": {
+      "main": [
+        [
+          {
+            "node": "Process Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Request": {
+      "main": [
+        [
+          {
+            "node": "Needs Change?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create New Event": {
+      "main": [
+        [
+          {
+            "node": "Delete Old Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Old Event": {
+      "main": [
+        [
+          {
+            "node": "Build Update Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Update Row": {
+      "main": [
+        [
+          {
+            "node": "Update Appointment Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Appointment Row": {
+      "main": [
+        [
+          {
+            "node": "Respond Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Done": {
+      "main": [
+        [
+          {
+            "node": "Has Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Change?": {
+      "main": [
+        [
+          {
+            "node": "Is Cancel?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Cancel?": {
+      "main": [
+        [
+          {
+            "node": "Delete Old Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create New Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Email?": {
+      "main": [
+        [
+          {
+            "node": "Send Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

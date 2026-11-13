@@ -9,6 +9,7 @@ A demo project for a fictional hospital (**City Care Hospital**, fictional docto
 ## Demo
 
 - Demo video and write-up: [LinkedIn post](https://www.linkedin.com/feed/update/urn:li:activity:7522353009175969794/)
+- Version 2: [LinkedIn post](https://www.linkedin.com/feed/update/urn:li:activity:7526889953184669697/)
 
 
 ## What it does
